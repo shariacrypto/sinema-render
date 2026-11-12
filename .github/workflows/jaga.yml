@@ -1,0 +1,48 @@
+name: Jaga render macet
+
+# Tiap 20 menit memeriksa repo privat Shariacrypto: adakah paket reels yang belum punya media lebih dari 100 menit
+# setelah disetujui untuk dibuat (mis. render di sini gagal total sebelum mengabari balik). Bila ada, repo privat
+# dikabari (repository_dispatch "sinema-render-macet") dan mengirim peringatan Telegram, sekali per paket.
+# Logika ada di repo privat (tools/konten/jaga_render.py). Log repo ini publik: id & isi paket tidak dicetak.
+# Catatan: GitHub mematikan jadwal repo publik setelah 60 hari tanpa commit; GitHub mengirim email sebelumnya.
+# Secret: RENDER_TOKEN (sama dengan workflow render).
+
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jaga
+  cancel-in-progress: true
+
+jobs:
+  jaga:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ambil daftar paket dari repo privat
+        uses: actions/checkout@v4
+        with:
+          repository: shariacrypto/claude.shariacrypto
+          token: ${{ secrets.RENDER_TOKEN }}
+          sparse-checkout: |
+            konten/paket
+            tools/konten/jaga_render.py
+          sparse-checkout-cone-mode: false
+          path: privat
+          persist-credentials: false
+      - name: Cari & kabari
+        env:
+          GH_TOKEN: ${{ secrets.RENDER_TOKEN }}
+        run: |
+          python3 -I privat/tools/konten/jaga_render.py cari "$RUNNER_TEMP/macet"
+          ids=$(cat "$RUNNER_TEMP/macet")
+          [ -n "$ids" ] || exit 0
+          jq -n --arg ids "$ids" '{event_type: "sinema-render-macet", client_payload: {ids: $ids}}' \
+            | gh api -X POST repos/shariacrypto/claude.shariacrypto/dispatches --input - > /dev/null
+          echo "repo privat dikabari"

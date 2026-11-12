@@ -102,5 +102,7 @@ jobs:
           HASIL: ${{ needs.render.result }}
         run: |
           jq -n --arg asal "$ASAL" --arg publik "${{ github.run_id }}" --arg ids "$IDS" --arg hasil "$HASIL" \
-            '{event_type: "sinema-render-selesai", client_payload: {asal_run: $asal, publik_run: $publik, ids: $ids, hasil: $hasil}}' \
-            | gh api -X POST repos/shariacrypto/claude.shariacrypto/dispatches --input -
+            '{event_type: "sinema-render-selesai", client_payload: {asal_run: $asal, publik_run: $publik, ids: $ids, hasil: $hasil}}' > kabar.json
+          # dicoba ulang: kiriman balik yang gagal berarti reels tidak pernah sampai ke Telegram (jaga.yml memberi peringatan)
+          for i in 1 2 3 4; do gh api -X POST repos/shariacrypto/claude.shariacrypto/dispatches --input kabar.json && exit 0; sleep $((i*10)); done
+          exit 1
