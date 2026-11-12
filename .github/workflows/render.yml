@@ -56,10 +56,15 @@ jobs:
           github-token: ${{ secrets.RENDER_TOKEN }}
       - name: Pasang alat
         run: |
-          if ! which ffmpeg; then
-            curl -fsSL --max-time 120 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz \
-              && tar -xJf /tmp/ff.tar.xz -C /tmp && sudo cp /tmp/ffmpeg-*-static/ffmpeg /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/
-          fi
+          # ffmpeg wajib (12 Nov 2026: unduhan statis gagal diam-diam di 1 dari 8 mesin → potongan hilang): coba ulang, lalu apt
+          for i in 1 2 3; do
+            which ffmpeg && break
+            curl -fsSL --retry 2 --max-time 120 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz \
+              && tar -xJf /tmp/ff.tar.xz -C /tmp && sudo cp /tmp/ffmpeg-*-static/ffmpeg /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/ && break
+            sleep $((i*10))
+          done
+          which ffmpeg || { sudo timeout 300 apt-get update -q && sudo timeout 300 apt-get install -y -q ffmpeg; } || true
+          which ffmpeg || { echo "::error::ffmpeg tidak terpasang"; exit 1; }
           npm install -q --no-save playwright@1.48.2
           timeout 300 npx playwright install --with-deps chromium || npx playwright install chromium
       - name: Render & enkripsi potongan ${{ matrix.j }}
