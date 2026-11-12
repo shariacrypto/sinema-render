@@ -1,0 +1,106 @@
+name: Render potongan sinema
+
+# Dipicu repo privat shariacrypto/claude.shariacrypto (workflow konten-siapkan, job "publik") lewat workflow_dispatch.
+# 8 mesin masing-masing merender sepotong frame video dari folder kerja (artefak run asal), mengenkripsi hasilnya
+# (SEG_KUNCI, AES-256) lalu mengunggahnya sebagai artefak. Job terakhir mengabari repo privat (repository_dispatch).
+# Repo ini publik hanya agar menit Actions gratis; isi video tidak pernah tersimpan di sini tanpa enkripsi.
+# Secret: RENDER_TOKEN (token fine-grained: baca artefak & render.js repo privat, kirim repository_dispatch),
+#         SEG_KUNCI (sama dengan secret SEG_KUNCI di repo privat).
+
+on:
+  workflow_dispatch:
+    inputs:
+      asal_run:
+        description: "id run konten-siapkan di repo privat (sumber artefak kerja)"
+        required: true
+      ids:
+        description: "id paket sinema, dipisah spasi"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        j: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - name: Periksa masukan
+        env:
+          ASAL: ${{ inputs.asal_run }}
+          IDS: ${{ inputs.ids }}
+        run: |
+          [[ "$ASAL" =~ ^[0-9]+$ ]] || { echo "::error::asal_run tidak sah"; exit 1; }
+          for id in $IDS; do [[ "$id" =~ ^[0-9a-z-]+$ ]] || { echo "::error::id tidak sah"; exit 1; }; done
+      - name: Ambil render.js dari repo privat
+        uses: actions/checkout@v4
+        with:
+          repository: shariacrypto/claude.shariacrypto
+          token: ${{ secrets.RENDER_TOKEN }}
+          sparse-checkout: tools/konten/sinema/render.js
+          sparse-checkout-cone-mode: false
+          path: mesin
+          persist-credentials: false
+      - name: Ambil folder kerja
+        uses: actions/download-artifact@v4
+        with:
+          name: kerja
+          path: ${{ runner.temp }}/k
+          repository: shariacrypto/claude.shariacrypto
+          run-id: ${{ inputs.asal_run }}
+          github-token: ${{ secrets.RENDER_TOKEN }}
+      - name: Pasang alat
+        run: |
+          if ! which ffmpeg; then
+            curl -fsSL --max-time 120 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz \
+              && tar -xJf /tmp/ff.tar.xz -C /tmp && sudo cp /tmp/ffmpeg-*-static/ffmpeg /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/
+          fi
+          npm install -q --no-save playwright@1.48.2
+          timeout 300 npx playwright install --with-deps chromium || npx playwright install chromium
+      - name: Render & enkripsi potongan ${{ matrix.j }}
+        env:
+          SEG_KUNCI: ${{ secrets.SEG_KUNCI }}
+          IDS: ${{ inputs.ids }}
+        run: |
+          [ -n "$SEG_KUNCI" ] || { echo "::error::secret SEG_KUNCI kosong"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/seg"
+          for id in $IDS; do
+            k="$RUNNER_TEMP/k/$id/kerja_sinema"; [ -f "$k/susun.json" ] || { echo "::warning::kerja $id tidak ada"; continue; }
+            mkdir -p "$RUNNER_TEMP/polos/$id" "$RUNNER_TEMP/seg/$id"
+            polos="$RUNNER_TEMP/polos/$id/seg_${{ matrix.j }}.mp4"
+            if NODE_PATH="$PWD/node_modules" node mesin/tools/konten/sinema/render.js "$k" potong "${{ matrix.j }}/8" "$polos"; then
+              [ -s "$polos" ] && openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:SEG_KUNCI \
+                -in "$polos" -out "$RUNNER_TEMP/seg/$id/seg_${{ matrix.j }}.mp4.enc"
+            else
+              echo "::warning::potongan ${{ matrix.j }} $id gagal"
+            fi
+            rm -f "$polos"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seg-${{ matrix.j }}
+          path: ${{ runner.temp }}/seg/
+          retention-days: 1
+          if-no-files-found: ignore
+
+  kabari:
+    needs: render
+    if: always() && github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Kirim balik ke repo privat
+        env:
+          GH_TOKEN: ${{ secrets.RENDER_TOKEN }}
+          ASAL: ${{ inputs.asal_run }}
+          IDS: ${{ inputs.ids }}
+          HASIL: ${{ needs.render.result }}
+        run: |
+          jq -n --arg asal "$ASAL" --arg publik "${{ github.run_id }}" --arg ids "$IDS" --arg hasil "$HASIL" \
+            '{event_type: "sinema-render-selesai", client_payload: {asal_run: $asal, publik_run: $publik, ids: $ids, hasil: $hasil}}' \
+            | gh api -X POST repos/shariacrypto/claude.shariacrypto/dispatches --input -
