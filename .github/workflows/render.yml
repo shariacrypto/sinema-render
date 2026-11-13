@@ -1,6 +1,8 @@
 name: Render potongan sinema
 
-# Dipicu repo privat shariacrypto/claude.shariacrypto (workflow konten-siapkan, job "publik") lewat workflow_dispatch.
+# Dipicu repo privat shariacrypto/claude.shariacrypto lewat workflow_dispatch: konten-siapkan (reels, jenis "konten")
+# atau video-web (video lanskap situs, jenis "web"; kabar balik "video-web-render-selesai").
+# `ref` = cabang repo privat tempat render.js & hasil berada (kosong = cabang bawaan).
 # 8 mesin masing-masing merender sepotong frame video dari folder kerja (artefak run asal), mengenkripsi hasilnya
 # (SEG_KUNCI, AES-256) lalu mengunggahnya sebagai artefak. Job terakhir mengabari repo privat (repository_dispatch).
 # Repo ini publik hanya agar menit Actions gratis; isi video tidak pernah tersimpan di sini tanpa enkripsi.
@@ -16,6 +18,14 @@ on:
       ids:
         description: "id paket sinema, dipisah spasi"
         required: true
+      jenis:
+        description: "konten (reels, bawaan) atau web (video lanskap situs)"
+        required: false
+        default: konten
+      ref:
+        description: "cabang repo privat (render.js & tujuan hasil); kosong = cabang bawaan"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -34,14 +44,19 @@ jobs:
         env:
           ASAL: ${{ inputs.asal_run }}
           IDS: ${{ inputs.ids }}
+          JENIS: ${{ inputs.jenis }}
+          REF: ${{ inputs.ref }}
         run: |
           [[ "$ASAL" =~ ^[0-9]+$ ]] || { echo "::error::asal_run tidak sah"; exit 1; }
+          [[ -z "$JENIS" || "$JENIS" == konten || "$JENIS" == web ]] || { echo "::error::jenis tidak sah"; exit 1; }
+          [[ -z "$REF" || ( "$REF" =~ ^[A-Za-z0-9._/-]+$ && "$REF" != *..* ) ]] || { echo "::error::ref tidak sah"; exit 1; }
           for id in $IDS; do [[ "$id" =~ ^[0-9a-z-]+$ ]] || { echo "::error::id tidak sah"; exit 1; }; done
       - name: Ambil render.js dari repo privat
         uses: actions/checkout@v4
         with:
           repository: shariacrypto/claude.shariacrypto
           token: ${{ secrets.RENDER_TOKEN }}
+          ref: ${{ inputs.ref }}
           sparse-checkout: tools/konten/sinema/render.js
           sparse-checkout-cone-mode: false
           path: mesin
@@ -105,9 +120,12 @@ jobs:
           ASAL: ${{ inputs.asal_run }}
           IDS: ${{ inputs.ids }}
           HASIL: ${{ needs.render.result }}
+          JENIS: ${{ inputs.jenis }}
+          REF: ${{ inputs.ref }}
         run: |
-          jq -n --arg asal "$ASAL" --arg publik "${{ github.run_id }}" --arg ids "$IDS" --arg hasil "$HASIL" \
-            '{event_type: "sinema-render-selesai", client_payload: {asal_run: $asal, publik_run: $publik, ids: $ids, hasil: $hasil}}' > kabar.json
+          ev=sinema-render-selesai; [ "$JENIS" = web ] && ev=video-web-render-selesai
+          jq -n --arg ev "$ev" --arg asal "$ASAL" --arg publik "${{ github.run_id }}" --arg ids "$IDS" --arg hasil "$HASIL" --arg ref "$REF" \
+            '{event_type: $ev, client_payload: {asal_run: $asal, publik_run: $publik, ids: $ids, hasil: $hasil, ref: $ref}}' > kabar.json
           # dicoba ulang: kiriman balik yang gagal berarti reels tidak pernah sampai ke Telegram (jaga.yml memberi peringatan)
           for i in 1 2 3 4; do gh api -X POST repos/shariacrypto/claude.shariacrypto/dispatches --input kabar.json && exit 0; sleep $((i*10)); done
           exit 1
