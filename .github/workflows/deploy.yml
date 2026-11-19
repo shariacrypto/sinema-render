@@ -1,0 +1,126 @@
+name: Deploy situs Shariacrypto ke Cloudflare Pages
+
+# Menayangkan situs https://shariacrypto.id dari repo privat shariacrypto/claude.shariacrypto (folder site/ + functions/).
+# Dipindahkan ke repo publik ini atas keputusan pemilik (19 Nov 2026) karena menit Actions repo privat habis; repo publik
+# memakai menit gratis. Isinya sama dengan .github/workflows/cloudflare.yml di repo privat: ambil data pasar saat deploy,
+# lalu `wrangler pages deploy`. Situs tidak dibangun di sini (hasil build sudah di-commit di repo privat).
+#
+# Pemicu:
+#   - jadwal tiap 30 menit: deploy hanya bila commit main repo privat mengubah situs (site/, data/, tools/, functions/, cf/,
+#     kecuali bagian konten & bot) sejak commit yang terakhir tayang di Cloudflare. Selain itu selesai dalam hitungan detik.
+#   - workflow_dispatch: jalankan manual; centang "paksa" untuk deploy walau tidak ada perubahan.
+#
+# Log repo ini PUBLIK: tidak ada isi berkas yang dicetak; secret disamarkan GitHub.
+# Secret: RENDER_TOKEN (sama dengan render.yml; baca isi repo privat), CLOUDFLARE_API_TOKEN (izin "Cloudflare Pages: Edit"),
+#         CLOUDFLARE_ACCOUNT_ID, COINGECKO_API_KEY (opsional). Nilainya sama dengan secret di repo privat.
+# Catatan: GitHub mematikan jadwal repo publik setelah 60 hari tanpa commit; GitHub mengirim email sebelumnya.
+
+on:
+  schedule:
+    - cron: "13,43 * * * *"
+  workflow_dispatch:
+    inputs:
+      paksa:
+        description: "Deploy walau tidak ada perubahan situs"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-situs
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PROYEK: shariacrypto
+      PRIVAT: shariacrypto/claude.shariacrypto
+    steps:
+      - name: Perlu deploy?
+        id: cek
+        env:
+          GH_TOKEN: ${{ secrets.RENDER_TOKEN }}
+          PAKSA: ${{ inputs.paksa }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ] || [ -z "$GH_TOKEN" ]; then
+            echo "::notice::Secret CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / RENDER_TOKEN belum diisi; deploy dilewati."
+            echo "siap=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          sha=$(gh api "repos/$PRIVAT/commits/main" --jq .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit main repo privat tidak terbaca"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # commit yang terakhir tayang (produksi) menurut Cloudflare
+          tayang=$(curl -fsS --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$PROYEK/deployments?env=production" \
+            | jq -r '[.result[] | select(.latest_stage.status == "success")][0].deployment_trigger.metadata.commit_hash // ""' 2>/dev/null || true)
+          echo "main: ${sha:0:7} · tayang: ${tayang:0:7}"
+          if [ "$PAKSA" = "true" ]; then echo "siap=1" >> "$GITHUB_OUTPUT"; echo "deploy dipaksa"; exit 0; fi
+          if [ "$sha" = "$tayang" ]; then echo "siap=0" >> "$GITHUB_OUTPUT"; echo "sudah terbaru"; exit 0; fi
+          if [[ ! "$tayang" =~ ^[0-9a-f]{40}$ ]]; then echo "siap=1" >> "$GITHUB_OUTPUT"; echo "commit tayang tidak diketahui: deploy"; exit 0; fi
+          # hanya deploy bila ada berkas situs yang berubah (aturan paths sama dengan cloudflare.yml repo privat)
+          ubah=$(gh api "repos/$PRIVAT/compare/$tayang...$sha" --jq '.files[].filename' 2>/dev/null || echo "__gagal__")
+          if [ "$ubah" = "__gagal__" ]; then echo "siap=1" >> "$GITHUB_OUTPUT"; echo "perbandingan gagal: deploy"; exit 0; fi
+          n=$(printf '%s\n' "$ubah" | grep -E '^(site|data|tools|functions|cf)/' \
+            | grep -vcE '^(tools/konten|data/konten|cf/worker-konten|cf/worker-whale|cf/worker-onchain|tools/onchain)/' || true)
+          echo "berkas situs berubah: $n"
+          if [ "${n:-0}" -gt 0 ]; then echo "siap=1" >> "$GITHUB_OUTPUT"; else echo "siap=0" >> "$GITHUB_OUTPUT"; fi
+      - name: Ambil situs dari repo privat
+        if: steps.cek.outputs.siap == '1'
+        uses: actions/checkout@v4
+        with:
+          repository: shariacrypto/claude.shariacrypto
+          token: ${{ secrets.RENDER_TOKEN }}
+          ref: ${{ steps.cek.outputs.sha }}
+          sparse-checkout: |
+            site
+            data
+            tools
+            functions
+            cf
+          path: privat
+          persist-credentials: false
+      - name: Ambil data pasar CoinGecko
+        if: steps.cek.outputs.siap == '1'
+        continue-on-error: true
+        working-directory: privat
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: python3 tools/fetch_pasar.py
+      - name: Ambil data Riset Mendalam (CoinGecko, DefiLlama, rwa.xyz, Tokenomist)
+        if: steps.cek.outputs.siap == '1'
+        continue-on-error: true
+        working-directory: privat
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: python3 tools/fetch_riset_dalam.py
+      - name: Ambil riwayat harga Bitcoin bulanan (ShariaBitcoin)
+        if: steps.cek.outputs.siap == '1'
+        continue-on-error: true
+        working-directory: privat
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: python3 tools/fetch_bitcoin.py
+      - name: Kunci CoinGecko untuk Pages Function (opsional)
+        if: steps.cek.outputs.siap == '1'
+        continue-on-error: true
+        working-directory: privat
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: |
+          [ -n "$COINGECKO_API_KEY" ] || { echo "COINGECKO_API_KEY kosong; Pages Function memakai API publik."; exit 0; }
+          printf '%s' "$COINGECKO_API_KEY" | npx --yes wrangler@3 pages secret put COINGECKO_API_KEY --project-name="$PROYEK" > /dev/null
+      - name: Deploy ke Cloudflare Pages
+        if: steps.cek.outputs.siap == '1'
+        working-directory: privat
+        env:
+          SHA: ${{ steps.cek.outputs.sha }}
+        run: |
+          npx --yes wrangler@3 pages deploy site --project-name="$PROYEK" --branch=main \
+            --commit-hash="$SHA" --commit-message="main ${SHA:0:7} (lewat sinema-render)" --commit-dirty=true
