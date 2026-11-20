@@ -52,9 +52,14 @@ jobs:
         env:
           T: ${{ secrets.RENDER_TOKEN }}
           K: ${{ secrets.SEG_KUNCI }}
+          TG: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TGC: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GM: ${{ secrets.GEMINI_API_KEY }}
           ID: ${{ inputs.id }}
         run: |
           [ -n "$T" ] && [ -n "$K" ] || { echo "::error::secret RENDER_TOKEN / SEG_KUNCI kosong"; exit 1; }
+          # tanpa Telegram/Gemini paket akan diproses tanpa pratinjau & dengan suara cadangan, lalu dianggap selesai
+          [ -n "$TG" ] && [ -n "$TGC" ] && [ -n "$GM" ] || { echo "::error::secret TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / GEMINI_API_KEY belum diisi; tidak ada yang diproses"; exit 1; }
           [ -z "$ID" ] || [[ "$ID" =~ ^[0-9a-z-]+$ ]] || { echo "::error::id tidak sah"; exit 1; }
       - name: Ambil paket dari repo privat
         uses: actions/checkout@v4
