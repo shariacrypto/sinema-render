@@ -1,0 +1,402 @@
+name: Konten · buat media & minta persetujuan
+
+# Pindahan dari repo privat shariacrypto/claude.shariacrypto (keputusan pemilik 20 Nov 2026: menit Actions repo privat
+# habis; repo publik ini memakai menit gratis). Isi & berkas tetap di repo privat: tiap job mengambilnya dengan
+# RENDER_TOKEN, lalu menulis status/media.json kembali ke main repo privat.
+#
+# Alur (sama dengan konten-siapkan.yml lama, persetujuan dua tahap):
+#   Tahap 1: paket baru → cek kepatuhan → versi TEKS ke Telegram (▶️ Lanjut / ❌ Tolak).
+#   Tahap 2: setelah ▶️ (konten-tombol.yml memicu workflow ini) → suara + data adegan (kerja) → render ×8 → sambung,
+#            audio, unggah ke R2/Cloudflare → pratinjau media ke Telegram (✅ / ❌).
+# Pemicu: jadwal tiap 10 menit (pengganti pemicu push repo privat; selesai dalam hitungan detik bila tidak ada paket),
+#         workflow_dispatch (dari konten-tombol, atau manual dengan id untuk membuat ulang satu paket).
+#
+# LOG REPO INI PUBLIK. Keluaran skrip konten (naskah, cek kepatuhan) tidak dicetak: ditulis ke berkas log yang diunggah
+# terenkripsi (SEG_KUNCI); bila langkah gagal hanya 25 baris terakhir yang ditampilkan. Semua artefak antarjob dienkripsi.
+# Yang terlihat publik hanya id paket (tanggal-slot-slug).
+#
+# Secret: RENDER_TOKEN (baca & tulis isi repo privat), SEG_KUNCI, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY,
+#         GOOGLE_TTS_KEY (opsional), CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+#         R2_BUCKET, R2_PUBLIC_URL. Nilainya sama dengan secret di repo privat.
+
+on:
+  schedule:
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch:
+    inputs:
+      id:
+        description: "id paket untuk dibuat ulang (kosong = semua yang perlu diproses)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: konten-siapkan
+  cancel-in-progress: false
+
+env:
+  PRIVAT: shariacrypto/claude.shariacrypto
+
+jobs:
+  pilah:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rencana: ${{ steps.cari.outputs.rencana }}
+      daftar: ${{ steps.cari.outputs.daftar }}
+      sinema: ${{ steps.sinema.outputs.sinema }}
+    steps:
+      - name: Periksa secret & masukan
+        env:
+          T: ${{ secrets.RENDER_TOKEN }}
+          K: ${{ secrets.SEG_KUNCI }}
+          ID: ${{ inputs.id }}
+        run: |
+          [ -n "$T" ] && [ -n "$K" ] || { echo "::error::secret RENDER_TOKEN / SEG_KUNCI kosong"; exit 1; }
+          [ -z "$ID" ] || [[ "$ID" =~ ^[0-9a-z-]+$ ]] || { echo "::error::id tidak sah"; exit 1; }
+      - name: Ambil paket dari repo privat
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVAT }}
+          token: ${{ secrets.RENDER_TOKEN }}
+          sparse-checkout: |
+            konten/paket
+            tools/konten
+            data/konten
+          persist-credentials: false
+      - name: Cari paket
+        id: cari
+        env:
+          ID: ${{ inputs.id }}
+        run: python3 tools/konten/telegram.py pilah "$ID"
+      - name: Paket sinema (render dibagi)
+        id: sinema
+        env:
+          DAFTAR: ${{ steps.cari.outputs.daftar }}
+        run: |
+          s=$(for id in $DAFTAR; do
+            python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("sinema") else 1)' "konten/paket/$id/paket.json" && echo -n "$id " || true
+          done)
+          echo "sinema=${s% }" >> "$GITHUB_OUTPUT"
+
+  kerja:
+    needs: pilah
+    if: needs.pilah.outputs.sinema != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_TTS_KEY: ${{ secrets.GOOGLE_TTS_KEY }}
+      SEG_KUNCI: ${{ secrets.SEG_KUNCI }}
+      SINEMA: ${{ needs.pilah.outputs.sinema }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVAT }}
+          token: ${{ secrets.RENDER_TOKEN }}
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/shariacrypto-konten/api
+          key: konten-api-kerja-${{ github.run_id }}
+          restore-keys: konten-api-
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-base-v1
+      - name: Pasang alat
+        run: |
+          if ! which ffmpeg; then
+            curl -fsSL --max-time 120 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz \
+              && tar -xJf /tmp/ff.tar.xz -C /tmp && sudo cp /tmp/ffmpeg-*-static/ffmpeg /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/
+          fi
+          pip install -q requests edge-tts pillow faster-whisper numpy
+      - name: Suara & data adegan
+        run: |
+          export KONTEN_CACHE_API="$HOME/.cache/shariacrypto-konten/api"
+          log="$RUNNER_TEMP/log/kerja.txt"; mkdir -p "$(dirname "$log")"
+          for id in $SINEMA; do
+            if python3 -u tools/konten/sinema/buat.py "konten/paket/$id" "$RUNNER_TEMP/k/$id" --tahap kerja >>"$log" 2>&1; then
+              echo "kerja $id: OK"
+            else
+              echo "::warning::kerja $id gagal; job siapkan merender di satu mesin"; tail -n 25 "$log"; rm -rf "$RUNNER_TEMP/k/$id"
+            fi
+          done
+      - name: Enkripsi folder kerja & log
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/enc"
+          [ -d "$RUNNER_TEMP/k" ] && tar -C "$RUNNER_TEMP" -czf - k | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:SEG_KUNCI -out "$RUNNER_TEMP/enc/kerja.tgz.enc" || true
+          [ -d "$RUNNER_TEMP/log" ] && tar -C "$RUNNER_TEMP" -czf - log | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:SEG_KUNCI -out "$RUNNER_TEMP/enc/log-kerja.tgz.enc" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kerja
+          path: ${{ runner.temp }}/enc/kerja.tgz.enc
+          retention-days: 1
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-kerja
+          path: ${{ runner.temp }}/enc/log-kerja.tgz.enc
+          retention-days: 7
+          if-no-files-found: ignore
+
+  render:
+    needs: [pilah, kerja]
+    if: needs.pilah.outputs.sinema != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        j: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      SEG_KUNCI: ${{ secrets.SEG_KUNCI }}
+      SINEMA: ${{ needs.pilah.outputs.sinema }}
+    steps:
+      - name: Ambil render.js dari repo privat
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVAT }}
+          token: ${{ secrets.RENDER_TOKEN }}
+          sparse-checkout: tools/konten/sinema/render.js
+          sparse-checkout-cone-mode: false
+          path: mesin
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: kerja
+          path: ${{ runner.temp }}/enc
+      - name: Buka folder kerja
+        run: openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SEG_KUNCI -in "$RUNNER_TEMP/enc/kerja.tgz.enc" | tar -C "$RUNNER_TEMP" -xzf -
+      - name: Pasang alat
+        run: |
+          for i in 1 2 3; do
+            which ffmpeg && break
+            curl -fsSL --retry 2 --max-time 120 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz \
+              && tar -xJf /tmp/ff.tar.xz -C /tmp && sudo cp /tmp/ffmpeg-*-static/ffmpeg /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/ && break
+            sleep $((i*10))
+          done
+          which ffmpeg || { sudo timeout 300 apt-get update -q && sudo timeout 300 apt-get install -y -q ffmpeg; } || true
+          which ffmpeg || { echo "::error::ffmpeg tidak terpasang"; exit 1; }
+          npm install -q --no-save playwright@1.48.2
+          timeout 300 npx playwright install --with-deps chromium || npx playwright install chromium
+      - name: Render & enkripsi potongan ${{ matrix.j }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/seg"
+          for id in $SINEMA; do
+            k="$RUNNER_TEMP/k/$id/kerja_sinema"; [ -f "$k/susun.json" ] || { echo "::warning::kerja $id tidak ada"; continue; }
+            mkdir -p "$RUNNER_TEMP/polos/$id" "$RUNNER_TEMP/seg/$id"
+            polos="$RUNNER_TEMP/polos/$id/seg_${{ matrix.j }}.mp4"
+            if NODE_PATH="$PWD/node_modules" node mesin/tools/konten/sinema/render.js "$k" potong "${{ matrix.j }}/8" "$polos" > "$RUNNER_TEMP/render.log" 2>&1; then
+              [ -s "$polos" ] && openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:SEG_KUNCI \
+                -in "$polos" -out "$RUNNER_TEMP/seg/$id/seg_${{ matrix.j }}.mp4.enc"
+            else
+              echo "::warning::potongan ${{ matrix.j }} $id gagal"; tail -n 15 "$RUNNER_TEMP/render.log"
+            fi
+            rm -f "$polos"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seg-${{ matrix.j }}
+          path: ${{ runner.temp }}/seg/
+          retention-days: 1
+          if-no-files-found: ignore
+
+  siapkan:
+    needs: [pilah, kerja, render]
+    if: always() && needs.pilah.result == 'success' && (needs.pilah.outputs.daftar != '' || needs.pilah.outputs.rencana != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GOOGLE_TTS_KEY: ${{ secrets.GOOGLE_TTS_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+      SEG_KUNCI: ${{ secrets.SEG_KUNCI }}
+      RENCANA: ${{ needs.pilah.outputs.rencana }}
+      DAFTAR: ${{ needs.pilah.outputs.daftar }}
+      SINEMA: ${{ needs.pilah.outputs.sinema }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVAT }}
+          token: ${{ secrets.RENDER_TOKEN }}
+      - name: Siapkan log
+        run: mkdir -p "$RUNNER_TEMP/log"
+      - name: Kirim versi teks (tahap 1)
+        if: env.RENCANA != ''
+        run: |
+          log="$RUNNER_TEMP/log/rencana.txt"; gagal=0
+          for id in $RENCANA; do
+            dir="konten/paket/$id"
+            if ! cek=$(python3 tools/konten/paket.py cek "$dir" 2>&1); then
+              echo "$cek" >> "$log"
+              printf '{"paket_sha": "%s", "tahap": "cek", "waktu": "%s", "run": "%s"}\n' "$(sha256sum "$dir/paket.json" | cut -c1-16)" \
+                "$(TZ=Asia/Jakarta date '+%F %H:%M') WIB" "$RUN_URL" > "$dir/gagal.json"
+              python3 tools/konten/telegram.py lapor "⛔ Paket $id belum lolos cek, tidak dikirim:
+          $cek
+          Tidak dicoba ulang otomatis sampai paket.json diperbaiki." >>"$log" 2>&1
+              echo "::warning::$id belum lolos cek (rincian di Telegram)"; gagal=1; continue
+            fi
+            if python3 tools/konten/telegram.py rencana "$dir" >>"$log" 2>&1; then echo "rencana $id: terkirim"
+            else echo "::error::rencana $id gagal dikirim ke Telegram"; tail -n 15 "$log"; fi
+          done
+      - name: Tembolok suara & gambar API
+        if: env.DAFTAR != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/shariacrypto-konten/api
+          key: konten-api-${{ github.run_id }}
+          restore-keys: konten-api-
+      - name: Tembolok model Whisper
+        if: env.DAFTAR != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-base-v1
+      - name: Tembolok sampel orkestra (VSCO-2 CE CC0)
+        if: env.DAFTAR != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/shariacrypto-skor
+          key: skor-sampel-v1-44030090
+      - name: Pasang alat
+        if: env.DAFTAR != ''
+        run: |
+          if ! (which ffmpeg && which pdftoppm); then
+            timeout 240 bash -c 'sudo apt-get update -q -o Acquire::Retries=1 -o Acquire::http::Timeout=15 && sudo apt-get install -y -q -o Acquire::Retries=1 -o Acquire::http::Timeout=15 ffmpeg poppler-utils' \
+              || echo "::warning::apt gagal/terlalu lama; pakai ffmpeg statis"
+          fi
+          if ! which ffmpeg; then
+            (curl -fsSL --max-time 120 https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz \
+              && tar -xJf /tmp/ff.tar.xz -C /tmp && sudo cp /tmp/ffmpeg-*-static/ffmpeg /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/) \
+            || (pip install -q imageio-ffmpeg && sudo ln -sf "$(python -c 'import imageio_ffmpeg as f; print(f.get_ffmpeg_exe())')" /usr/local/bin/ffmpeg)
+          fi
+          pip install -q requests boto3 edge-tts pillow scipy soundfile
+          pip install -q "rembg[cpu]" || echo "::notice::rembg gagal dipasang; foto tidak dipotong latarnya"
+          pip install -q faster-whisper numpy || echo "::notice::faster-whisper gagal dipasang; waktu subtitle memakai taksiran jeda"
+          npm install -q --no-save playwright@1.48.2
+          timeout 300 npx playwright install --with-deps chromium || npx playwright install chromium
+      - name: Ambil folder kerja (terenkripsi)
+        if: env.SINEMA != '' && env.DAFTAR != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: kerja
+          path: ${{ runner.temp }}/enc
+      - name: Ambil potongan frame (terenkripsi)
+        if: env.SINEMA != '' && env.DAFTAR != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: seg-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/seg-enc
+      - name: Buka enkripsi
+        if: env.SINEMA != '' && env.DAFTAR != ''
+        run: |
+          f="$RUNNER_TEMP/enc/kerja.tgz.enc"
+          [ -f "$f" ] && openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SEG_KUNCI -in "$f" | tar -C "$RUNNER_TEMP" -xzf - \
+            || echo "::warning::folder kerja tidak ada; render di satu mesin"
+          [ -d "$RUNNER_TEMP/seg-enc" ] || exit 0
+          cd "$RUNNER_TEMP/seg-enc"
+          find . -name '*.mp4.enc' | while read -r f; do
+            out="$RUNNER_TEMP/seg/${f#./}"; out="${out%.enc}"; mkdir -p "$(dirname "$out")"
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SEG_KUNCI -in "$f" -out "$out" || { echo "::warning::gagal membuka $f"; rm -f "$out"; }
+          done
+      - name: Sambung potongan frame (sinema)
+        if: env.SINEMA != '' && env.DAFTAR != ''
+        run: |
+          log="$RUNNER_TEMP/log/sambung.txt"
+          for id in $SINEMA; do
+            src="$RUNNER_TEMP/k/$id/kerja_sinema"
+            [ -f "$src/susun.json" ] || { echo "::warning::folder kerja $id tidak ada; render ulang di satu mesin"; continue; }
+            segs=""; lengkap=1
+            for j in 0 1 2 3 4 5 6 7; do
+              f="$RUNNER_TEMP/seg/$id/seg_$j.mp4"
+              if [ ! -s "$f" ]; then
+                echo "::warning::potongan $j $id tidak ada; dirender di sini"; mkdir -p "$(dirname "$f")"
+                NODE_PATH="$PWD/node_modules" node tools/konten/sinema/render.js "$src" potong "$j/8" "$f" >>"$log" 2>&1 || rm -f "$f"
+              fi
+              [ -s "$f" ] || lengkap=0; segs="$segs,$f"
+            done
+            if [ $lengkap = 0 ]; then echo "::warning::potongan $id tidak lengkap; render ulang di satu mesin"; continue; fi
+            mkdir -p "$RUNNER_TEMP/$id"; cp -r "$src" "$RUNNER_TEMP/$id/kerja_sinema"
+            NODE_PATH="$PWD/node_modules" node tools/konten/sinema/render.js "$RUNNER_TEMP/$id/kerja_sinema" gabung \
+              "$RUNNER_TEMP/$id/kerja_sinema/video_mentah.mp4" "${segs#,}" >>"$log" 2>&1 \
+              || { echo "::warning::gabung $id gagal; render ulang di satu mesin"; tail -n 15 "$log"; rm -rf "$RUNNER_TEMP/$id/kerja_sinema"; }
+          done
+      - name: Buat media & kirim ke Telegram
+        if: env.DAFTAR != ''
+        run: |
+          export KONTEN_CACHE_API="$HOME/.cache/shariacrypto-konten/api"
+          find "$KONTEN_CACHE_API" -type f -mtime +30 -delete 2>/dev/null || true
+          log="$RUNNER_TEMP/log/media.txt"
+          catat_gagal() {
+            printf '{"paket_sha": "%s", "tahap": "%s", "waktu": "%s", "run": "%s"}\n' "$(sha256sum "$1/paket.json" | cut -c1-16)" "$2" \
+              "$(TZ=Asia/Jakarta date '+%F %H:%M') WIB" "$RUN_URL" > "$1/gagal.json"
+          }
+          gagal=0
+          for id in $DAFTAR; do
+            dir="konten/paket/$id"
+            if ! cek=$(python3 tools/konten/paket.py cek "$dir" 2>&1); then
+              echo "$cek" >> "$log"; catat_gagal "$dir" cek
+              python3 tools/konten/telegram.py lapor "⛔ Paket $id belum lolos cek, media tidak dibuat:
+          $cek
+          Tidak dicoba ulang otomatis sampai paket.json diperbaiki." >>"$log" 2>&1
+              echo "::warning::$id belum lolos cek (rincian di Telegram)"; gagal=1; continue
+            fi
+            hasil="$RUNNER_TEMP/$id"
+            if NODE_PATH="$PWD/node_modules" python3 tools/konten/buat_media.py "$dir" --hasil "$hasil" --unggah >>"$log" 2>&1; then
+              rm -f "$dir/gagal.json"
+              python3 tools/konten/telegram.py kirim "$dir" "$hasil" >>"$log" 2>&1 || echo "::warning::pratinjau $id gagal dikirim ke Telegram"
+              echo "media $id: OK"
+            else
+              catat_gagal "$dir" media
+              echo "::error::media $id gagal"; tail -n 25 "$log"
+              python3 tools/konten/telegram.py lapor "⛔ Media paket $id gagal dibuat. Cek log: $RUN_URL. Tidak dicoba ulang otomatis; jalankan manual (sinema-render → Actions → Konten · buat media → id $id) setelah penyebabnya beres." >>"$log" 2>&1
+              gagal=1
+            fi
+          done
+          exit $gagal
+      - name: Commit media.json & status ke repo privat
+        if: always()
+        run: |
+          git config user.name "shariacrypto-bot"
+          git config user.email "shariacrypto-bot@users.noreply.github.com"
+          git add -A -- konten/paket
+          git diff --cached --quiet && exit 0
+          if [ -n "$DAFTAR" ]; then judul="media siap ($DAFTAR)"; else judul="rencana teks dikirim ($RENCANA)"; fi
+          git commit -q -m "Konten: $judul"
+          for i in 1 2 3; do
+            git pull --rebase -X theirs -q origin main && git push -q origin HEAD:main && exit 0
+            git rebase --abort 2>/dev/null || true
+            sleep $((i*5))
+          done
+          exit 1
+      - name: Enkripsi log
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/enc-log"
+          tar -C "$RUNNER_TEMP" -czf - log | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:SEG_KUNCI -out "$RUNNER_TEMP/enc-log/log-siapkan.tgz.enc" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-siapkan
+          path: ${{ runner.temp }}/enc-log/
+          retention-days: 7
+          if-no-files-found: ignore

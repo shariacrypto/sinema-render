@@ -1,0 +1,81 @@
+name: Konten · tayangkan
+
+# Pindahan dari repo privat (20 Nov 2026, menit Actions repo privat habis). Membaca persetujuan Telegram lalu
+# menayangkan paket yang disetujui ke Threads, X, Instagram, Facebook, TikTok (inbox draf), YouTube.
+# Dipicu Worker "shariacrypto-bot" tepat 07.00/19.00 WIB dengan input `slot`, atau konten-tombol (🚀) dengan `id`,
+# atau manual. Status ditulis kembali ke repo privat. Log publik: keluaran skrip ditulis ke berkas, bukan ke log.
+# Secret: RENDER_TOKEN, TELEGRAM_*, THREADS_*, META_TOKEN, IG_USER_ID, FB_PAGE_*, X_*, TIKTOK_*, YOUTUBE_*,
+#         GH_PAT (opsional: token fine-grained repo INI dengan izin "Secrets: Read and write", untuk menyimpan token
+#         Threads/TikTok yang diperbarui otomatis).
+
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: "id paket (kosong = semua yang disetujui)"
+        required: false
+      slot:
+        description: "pagi | malam (diisi Worker; kosong = tayang sekarang)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: konten-terbit
+  cancel-in-progress: false
+
+jobs:
+  terbit:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
+      THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
+      META_TOKEN: ${{ secrets.META_TOKEN }}
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+      FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+      X_API_KEY: ${{ secrets.X_API_KEY }}
+      X_API_SECRET: ${{ secrets.X_API_SECRET }}
+      X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+      X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+      TIKTOK_CLIENT_KEY: ${{ secrets.TIKTOK_CLIENT_KEY }}
+      TIKTOK_CLIENT_SECRET: ${{ secrets.TIKTOK_CLIENT_SECRET }}
+      TIKTOK_REFRESH_TOKEN: ${{ secrets.TIKTOK_REFRESH_TOKEN }}
+      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      ID: ${{ inputs.id }}
+      SLOT: ${{ inputs.slot }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shariacrypto/claude.shariacrypto
+          token: ${{ secrets.RENDER_TOKEN }}
+      - run: pip install -q requests requests-oauthlib pynacl
+      - name: Baca persetujuan & tayangkan
+        run: |
+          case "$SLOT" in pagi|malam|"") ;; *) echo "slot tidak dikenal"; exit 1;; esac
+          [ -z "$ID" ] || [[ "$ID" =~ ^[0-9a-z-]+$ ]] || { echo "id tidak sah"; exit 1; }
+          log="$RUNNER_TEMP/terbit.txt"
+          python3 tools/konten/telegram.py cek >"$log" 2>&1 || true
+          if [ -n "$ID" ]; then set -- --sekarang --id "$ID"
+          elif [ -n "$SLOT" ]; then set -- --slot "$SLOT"
+          else set -- --sekarang; fi
+          if python3 tools/konten/terbit.py "$@" >>"$log" 2>&1; then echo "tayang: selesai ($*)"
+          else echo "::error::tayang gagal"; tail -n 25 "$log"; exit 1; fi
+      - name: Commit status ke repo privat
+        if: always()
+        run: |
+          git config user.name "shariacrypto-bot"
+          git config user.email "shariacrypto-bot@users.noreply.github.com"
+          git add konten/paket/*/status.json 2>/dev/null || true
+          git diff --cached --quiet && exit 0
+          git commit -q -m "Konten: status persetujuan/tayang $(TZ=Asia/Jakarta date +%F\ %H:%M) WIB"
+          for i in 1 2 3; do git pull --rebase -q origin main && git push -q origin HEAD:main && exit 0; sleep $((i*5)); done
+          exit 1

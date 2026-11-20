@@ -1,11 +1,11 @@
 name: Jaga render macet
 
 # Tiap 20 menit memeriksa repo privat Shariacrypto: adakah paket reels yang belum punya media lebih dari 100 menit
-# setelah disetujui untuk dibuat (mis. render di sini gagal total sebelum mengabari balik). Bila ada, repo privat
-# dikabari (repository_dispatch "sinema-render-macet") dan mengirim peringatan Telegram, sekali per paket.
+# setelah disetujui untuk dibuat (mis. render gagal total). Bila ada, peringatan Telegram dikirim langsung dari sini
+# (sejak 20 Nov 2026; dulu lewat konten-jaga.yml repo privat) dan dicatat di status.json repo privat, sekali per paket.
 # Logika ada di repo privat (tools/konten/jaga_render.py). Log repo ini publik: id & isi paket tidak dicetak.
 # Catatan: GitHub mematikan jadwal repo publik setelah 60 hari tanpa commit; GitHub mengirim email sebelumnya.
-# Secret: RENDER_TOKEN (sama dengan workflow render).
+# Secret: RENDER_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
 
 on:
   schedule:
@@ -32,17 +32,28 @@ jobs:
           token: ${{ secrets.RENDER_TOKEN }}
           sparse-checkout: |
             konten/paket
-            tools/konten/jaga_render.py
-          sparse-checkout-cone-mode: false
-          path: privat
-          persist-credentials: false
-      - name: Cari & kabari
+            tools/konten
+            data/konten
+      - name: Cari & kirim peringatan
         env:
-          GH_TOKEN: ${{ secrets.RENDER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python3 -I privat/tools/konten/jaga_render.py cari "$RUNNER_TEMP/macet"
+          python3 -I tools/konten/jaga_render.py cari "$RUNNER_TEMP/macet" >/dev/null
           ids=$(cat "$RUNNER_TEMP/macet")
-          [ -n "$ids" ] || exit 0
-          jq -n --arg ids "$ids" '{event_type: "sinema-render-macet", client_payload: {ids: $ids}}' \
-            | gh api -X POST repos/shariacrypto/claude.shariacrypto/dispatches --input - > /dev/null
-          echo "repo privat dikabari"
+          [ -n "$ids" ] || { echo "tidak ada yang macet"; exit 0; }
+          python3 tools/konten/jaga_render.py lapor $ids >"$RUNNER_TEMP/jaga.txt" 2>&1 || { tail -n 15 "$RUNNER_TEMP/jaga.txt"; exit 1; }
+          echo "peringatan dikirim"
+      - name: Commit catatan peringatan ke repo privat
+        run: |
+          git config user.name "shariacrypto-bot"
+          git config user.email "shariacrypto-bot@users.noreply.github.com"
+          git add -A -- konten/paket
+          git diff --cached --quiet && exit 0
+          git commit -q -m "Konten: peringatan render macet dicatat"
+          for i in 1 2 3; do
+            git pull --rebase -X theirs -q origin main && git push -q origin HEAD:main && exit 0
+            git rebase --abort 2>/dev/null || true
+            sleep $((i*5))
+          done
+          exit 1

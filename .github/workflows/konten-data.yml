@@ -1,0 +1,46 @@
+name: Konten · ambil data harian
+
+# Pindahan dari repo privat (20 Nov 2026, menit Actions repo privat habis). 05.15 & 16.15 WIB: data pasar & berita
+# (DefiLlama, CoinGecko, kurs, RSS) → konten/data/<tanggal>.json di repo privat, bahan sesi /konten.
+# Secret: RENDER_TOKEN, COINGECKO_API_KEY (opsional).
+
+on:
+  schedule:
+    - cron: "15 22 * * *"
+    - cron: "15 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: konten-data
+  cancel-in-progress: false
+
+jobs:
+  data:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shariacrypto/claude.shariacrypto
+          token: ${{ secrets.RENDER_TOKEN }}
+      - name: Ambil data
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: |
+          python3 tools/konten/ambil_data.py >"$RUNNER_TEMP/data.txt" 2>&1 || { tail -n 20 "$RUNNER_TEMP/data.txt"; exit 1; }
+          echo "data diambil"
+      - name: Hapus data lebih dari 30 hari
+        run: find konten/data -name "20*.json" -mtime +30 -delete || true
+      - name: Commit ke repo privat
+        run: |
+          git config user.name "shariacrypto-bot"
+          git config user.email "shariacrypto-bot@users.noreply.github.com"
+          git add -A konten/data
+          git diff --cached --quiet && exit 0
+          git commit -q -m "Konten: data harian $(TZ=Asia/Jakarta date +%F\ %H:%M) WIB"
+          for i in 1 2 3; do git pull --rebase -q origin main && git push -q origin HEAD:main && exit 0; sleep $((i*5)); done
+          exit 1

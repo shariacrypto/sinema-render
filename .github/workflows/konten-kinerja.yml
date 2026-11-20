@@ -1,0 +1,67 @@
+name: Konten · kinerja
+
+# Pindahan dari repo privat (20 Nov 2026, menit Actions repo privat habis). 21.40 WIB tiap hari: angka tayangan
+# per platform → konten/kinerja.json di repo privat; Senin juga ringkasan mingguan ke Telegram.
+# Secret: RENDER_TOKEN, TELEGRAM_*, META_TOKEN, IG_USER_ID, FB_PAGE_*, YOUTUBE_*, THREADS_TOKEN, TIKTOK_*, GH_PAT (opsional).
+
+on:
+  schedule:
+    - cron: "40 14 * * *"
+  workflow_dispatch:
+    inputs:
+      lapor:
+        description: "kirim ringkasan ke Telegram sekarang"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: konten-kinerja
+  cancel-in-progress: false
+
+jobs:
+  kinerja:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      META_TOKEN: ${{ secrets.META_TOKEN }}
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+      FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+      YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+      THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
+      TIKTOK_CLIENT_KEY: ${{ secrets.TIKTOK_CLIENT_KEY }}
+      TIKTOK_CLIENT_SECRET: ${{ secrets.TIKTOK_CLIENT_SECRET }}
+      TIKTOK_REFRESH_TOKEN: ${{ secrets.TIKTOK_REFRESH_TOKEN }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shariacrypto/claude.shariacrypto
+          token: ${{ secrets.RENDER_TOKEN }}
+      - run: pip install -q requests pynacl
+      - name: Ambil angka & ringkasan
+        run: |
+          log="$RUNNER_TEMP/kinerja.txt"
+          python3 tools/konten/kinerja.py ambil >"$log" 2>&1 || { tail -n 20 "$log"; exit 1; }
+          if [ "${{ inputs.lapor }}" = "true" ] || [ "$(TZ=Asia/Jakarta date +%u)" = "1" ]; then
+            python3 tools/konten/kinerja.py lapor >>"$log" 2>&1 || { tail -n 20 "$log"; exit 1; }
+          fi
+          echo "kinerja diperbarui"
+      - name: Commit ke repo privat
+        run: |
+          git config user.name "shariacrypto-bot"
+          git config user.email "shariacrypto-bot@users.noreply.github.com"
+          git add konten/kinerja.json
+          git diff --cached --quiet && exit 0
+          git commit -q -m "Konten: kinerja $(TZ=Asia/Jakarta date +%F)"
+          for i in 1 2 3; do git pull --rebase -q origin main && git push -q origin HEAD:main && exit 0; sleep $((i*5)); done
+          exit 1

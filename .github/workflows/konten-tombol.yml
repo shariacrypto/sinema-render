@@ -1,0 +1,77 @@
+name: Konten · baca tombol Telegram
+
+# Pindahan dari repo privat (20 Nov 2026, menit Actions repo privat habis). Mencatat tombol ▶️/✅/❌/🚀 dan perintah
+# Telegram ke konten/paket/<id>/status.json di repo privat, lalu bot membalas di chat.
+# Dipicu Worker "shariacrypto-bot" (REPO = shariacrypto/sinema-render) dengan input `perintah`.
+# "lanjut <id>" → setelah dicatat, "Konten · buat media" di repo ini dipicu; "sekarang <id>" → "Konten · tayangkan".
+# Log publik: keluaran skrip ditulis ke berkas, bukan ke log.
+# Secret: RENDER_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
+
+on:
+  workflow_dispatch:
+    inputs:
+      perintah:
+        description: "lanjut <id> | setuju <id> | sekarang <id> | tolak <id> | antre (kosong = baca tombol lewat getUpdates)"
+        required: false
+      oleh:
+        description: "username Telegram yang menekan tombol"
+        required: false
+      pesan_id:
+        description: "message_id pratinjau (tombolnya dibersihkan setelah dicatat)"
+        required: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: konten-tombol-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  tombol:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PERINTAH: ${{ inputs.perintah }}
+      OLEH: ${{ inputs.oleh }}
+      PESAN_ID: ${{ inputs.pesan_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shariacrypto/claude.shariacrypto
+          token: ${{ secrets.RENDER_TOKEN }}
+          sparse-checkout: |
+            konten/paket
+            tools/konten
+            data/konten
+      - name: Catat keputusan
+        id: catat
+        run: |
+          log="$RUNNER_TEMP/tombol.txt"
+          if [ -n "$PERINTAH" ]; then python3 tools/konten/telegram.py jalankan "$PERINTAH" "$OLEH" "$PESAN_ID" >"$log" 2>&1 || { tail -n 15 "$log"; exit 1; }
+          else python3 tools/konten/telegram.py cek >"$log" 2>&1 || { tail -n 15 "$log"; exit 1; }; fi
+          echo "dicatat"
+      - name: Commit status ke repo privat
+        run: |
+          git config user.name "shariacrypto-bot"
+          git config user.email "shariacrypto-bot@users.noreply.github.com"
+          git add konten/paket/*/status.json 2>/dev/null || true
+          git diff --cached --quiet && exit 0
+          git commit -q -m "Konten: status persetujuan $(TZ=Asia/Jakarta date +%F\ %H:%M) WIB"
+          for i in 1 2 3 4; do git pull --rebase -q origin main && git push -q origin HEAD:main && exit 0; sleep $((i*5)); done
+          exit 1
+      - name: Tayang sekarang setelah 🚀
+        if: steps.catat.outputs.sekarang != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID_PAKET: ${{ steps.catat.outputs.sekarang }}
+        run: gh workflow run konten-terbit.yml -R "$GITHUB_REPOSITORY" --ref main -f id="$ID_PAKET"
+      - name: Buat media setelah ▶️ Lanjut
+        if: steps.catat.outputs.lanjut == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run konten-siapkan.yml -R "$GITHUB_REPOSITORY" --ref main
