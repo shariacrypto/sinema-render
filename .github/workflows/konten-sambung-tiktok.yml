@@ -40,7 +40,9 @@ jobs:
         with:
           repository: shariacrypto/claude.shariacrypto
           token: ${{ secrets.RENDER_TOKEN }}
-          sparse-checkout: tools/konten
+          sparse-checkout: |
+            tools/konten
+            data/konten
           persist-credentials: false
       - run: pip install -q requests pynacl
       - name: Jalankan
