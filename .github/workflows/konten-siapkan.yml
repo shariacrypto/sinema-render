@@ -75,6 +75,9 @@ jobs:
         id: cari
         env:
           ID: ${{ inputs.id }}
+          # dibutuhkan telegram.dua_tahap(): tanpa ini paket baru melewati tahap versi teks
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 tools/konten/telegram.py pilah "$ID"
       - name: Paket sinema (render dibagi)
         id: sinema
