@@ -1,0 +1,58 @@
+name: Konten · sambung TikTok
+
+# Pindahan dari repo privat (20 Nov 2026, menit Actions repo privat habis). Sekali saja: hubungkan akun TikTok
+# Shariacrypto ke app "Shariacrypto Konten" (docs/KONTEN_OTOMATIS.md repo privat).
+# 1) langkah = tautan → bot Telegram mengirim tautan izin TikTok (tautan lama di Telegram juga masih bisa dipakai).
+# 2) Setelah login & izinkan, salin alamat lengkap shariacrypto.id/?code=... → langkah = tukar, isian = alamat itu (≤ 5 menit).
+#    Refresh token disimpan sebagai secret TIKTOK_REFRESH_TOKEN repo INI (butuh GH_PAT dengan izin Secrets: Read and write);
+#    tanpa GH_PAT token dikirim ke chat Telegram pemilik. Token tidak pernah dicetak ke log.
+# Log repo ini publik: isian dibaca dari berkas event dan disamarkan, tidak dicetak.
+# Secret: RENDER_TOKEN, TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GH_PAT (opsional).
+
+on:
+  workflow_dispatch:
+    inputs:
+      langkah:
+        description: "tautan | tukar"
+        type: choice
+        options: [tautan, tukar]
+        default: tautan
+      isian:
+        description: "untuk 'tukar': alamat lengkap setelah login (berisi ?code=...)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  sambung:
+    if: github.repository == 'shariacrypto/sinema-render'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TIKTOK_CLIENT_KEY: ${{ secrets.TIKTOK_CLIENT_KEY }}
+      TIKTOK_CLIENT_SECRET: ${{ secrets.TIKTOK_CLIENT_SECRET }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shariacrypto/claude.shariacrypto
+          token: ${{ secrets.RENDER_TOKEN }}
+          sparse-checkout: tools/konten
+          persist-credentials: false
+      - run: pip install -q requests pynacl
+      - name: Jalankan
+        run: |
+          langkah=$(jq -r '.inputs.langkah // "tautan"' "$GITHUB_EVENT_PATH")
+          if [ "$langkah" = "tukar" ]; then
+            isian=$(jq -r '.inputs.isian // ""' "$GITHUB_EVENT_PATH")
+            [ -n "$isian" ] || { echo "isian kosong"; exit 1; }
+            echo "::add-mask::$isian"
+            kode=$(python3 -c 'import sys,urllib.parse as u; s=sys.argv[1]; print((u.parse_qs(u.urlparse(s).query).get("code") or [s])[0])' "$isian")
+            echo "::add-mask::$kode"
+            python3 tools/konten/sambung_tiktok.py tukar "$isian"
+          else
+            python3 tools/konten/sambung_tiktok.py tautan
+          fi
